@@ -1,0 +1,36 @@
+name: ArchieControl
+options:
+  bundleIdPrefix: com.silkyrich
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: J5L34SJZF2
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1"
+targets:
+  ArchieControl:
+    type: application
+    platform: iOS
+    sources: [ArchieControl]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.silkyrich.archiecontrol
+        INFOPLIST_KEY_CFBundleDisplayName: Archie Control
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: YES
+    info:
+      path: ArchieControl/Info.plist
+      properties:
+        CFBundleDisplayName: Archie Control
+        ITSAppUsesNonExemptEncryption: false
+        UILaunchScreen: {}
+        CFBundleURLTypes:
+          - CFBundleURLName: com.silkyrich.archiecontrol
+            CFBundleURLSchemes: [archiecontrol]

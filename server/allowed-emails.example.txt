@@ -1,0 +1,2 @@
+# one email per line; Cloudflare Access must also allow them
+you@example.com

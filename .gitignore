@@ -1,0 +1,15 @@
+# Xcode / build
+build/
+*.xcodeproj
+DerivedData/
+.DS_Store
+# server secrets and runtime state (live on the green PC only)
+server/unifi.key
+server/host.id
+server/state.json
+server/audit.log
+server/engine.log
+server/allowed-emails.txt
+# the real device/group definitions (personal addresses); commit the .example files instead
+server/archie-group.json
+server/devices.json
