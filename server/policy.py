@@ -31,8 +31,10 @@ Config: groups.json — {"<group>": {"prefix": "Archie - ", "hub": {...},
 archie-group.json is read as group "archie".
 """
 
+import contextlib
 import copy
 import datetime as dt
+import fcntl
 import json
 import os
 import ssl
@@ -46,6 +48,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 KEY_FILE = os.path.join(HERE, "unifi.key")
 HOST_FILE = os.path.join(HERE, "host.id")   # present => cloud key, relay via api.ui.com
 STATE_FILE = os.path.join(HERE, "state.json")
+LOCK_FILE = os.path.join(HERE, ".lock")
 GROUPS_FILE = os.path.join(HERE, "groups.json")
 LEGACY_GROUP_FILE = os.path.join(HERE, "archie-group.json")
 GATEWAY = "https://192.168.0.1/proxy/network/"
@@ -145,6 +148,19 @@ def load_state():
     if hub and all(":" in k for k in hub):  # pre-groups layout: flat mac map
         s["hub_seen"] = {"archie": hub}
     return s
+
+
+@contextlib.contextmanager
+def locked():
+    """One writer at a time. The cron tick and a command (from the CLI or the
+    API, which imports this module) both read-modify-write state.json and the
+    rules; without this a tick that started first can undo a `forget`."""
+    with open(LOCK_FILE, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def save_state(state):
@@ -316,6 +332,11 @@ def group_status(gname, rules=None, state=None, now=None):
 def cmd_tick():
     if not os.path.exists(KEY_FILE):
         return  # not provisioned yet; stay quiet rather than fill the log every minute
+    with locked():
+        _tick()
+
+
+def _tick():
     now = dt.datetime.now(TZ)
     state = load_state()
     for gname, desc, macs in sync_groups(state, now):
@@ -346,39 +367,47 @@ def cmd_tick():
 
 
 def cmd_allow(gname, target, spec, reason):
-    now = dt.datetime.now(TZ)
-    until = parse_until(spec, now)
-    state = load_state()
-    for r in resolve(target, managed_rules(gname)):
-        state["overrides"][r["_id"]] = {"until": until.isoformat(timespec="seconds"), "reason": reason,
-                                        "set_at": now.isoformat(timespec="seconds")}
-        if r["enabled"]:
-            set_enabled(r, False)
-        log(f"{gname}: allow until {until:%a %H:%M}: {r['description']}" + (f" ({reason})" if reason else ""))
-    save_state(state)
-    return until
+    with locked():
+        now = dt.datetime.now(TZ)
+        until = parse_until(spec, now)
+        state = load_state()
+        for r in resolve(target, managed_rules(gname)):
+            state["overrides"][r["_id"]] = {"until": until.isoformat(timespec="seconds"), "reason": reason,
+                                            "set_at": now.isoformat(timespec="seconds")}
+            if r["enabled"]:
+                set_enabled(r, False)
+            log(f"{gname}: allow until {until:%a %H:%M}: {r['description']}" + (f" ({reason})" if reason else ""))
+        save_state(state)
+        return until
 
 
 def cmd_revoke(gname, target):
-    state = load_state()
-    for r in resolve(target, managed_rules(gname)):
-        state["overrides"].pop(r["_id"], None)
-        if not r["enabled"]:
-            set_enabled(r, True)
-        log(f"{gname}: override revoked, rule on: {r['description']}")
-    save_state(state)
+    with locked():
+        state = load_state()
+        for r in resolve(target, managed_rules(gname)):
+            state["overrides"].pop(r["_id"], None)
+            if not r["enabled"]:
+                set_enabled(r, True)
+            log(f"{gname}: override revoked, rule on: {r['description']}")
+        save_state(state)
 
 
 def cmd_flush(gname, target):
-    for r in resolve(target, managed_rules(gname)):
-        if r["enabled"]:
-            flush(r)
-            log(f"{gname}: sessions cut: {r['description']}")
+    with locked():
+        for r in resolve(target, managed_rules(gname)):
+            if r["enabled"]:
+                flush(r)
+                log(f"{gname}: sessions cut: {r['description']}")
 
 
 def cmd_forget(gname, mac):
     """Drop a device from a group: from the discovered members and from every
     rule's target list. For when the wrong thing got plugged into the hub."""
+    with locked():
+        return _forget(gname, mac)
+
+
+def _forget(gname, mac):
     mac = mac.lower()
     state = load_state()
     was = state["hub_seen"].get(gname, {}).pop(mac, None)
