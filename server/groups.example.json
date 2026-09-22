@@ -1,0 +1,11 @@
+{
+  "_comment": "One entry per person. Rules belong to a person by description prefix. 'hub' = anything wired behind their own switch, remembered remember_days. Members are only ever added to rules; use `policy.py forget <group> <mac>` to drop one.",
+  "archie": {
+    "prefix": "Archie - ",
+    "hub": {"switch_mac": "aa:bb:cc:dd:ee:01", "remember_days": 30},
+    "consoles": {"11:22:33:44:55:01": "Switch", "11:22:33:44:55:02": "Xbox (wired)", "11:22:33:44:55:03": "Xbox (wifi)"},
+    "wifi": {"11:22:33:44:55:04": "iPad", "11:22:33:44:55:05": "Laptop (school)"},
+    "wired": ["11:22:33:44:55:02"],
+    "rules": {"<rule id from policy.py status>": ["hub", "consoles"], "<another rule id>": ["hub", "consoles", "wifi"]}
+  }
+}

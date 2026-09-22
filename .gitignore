@@ -13,3 +13,6 @@ server/allowed-emails.txt
 # the real device/group definitions (personal addresses); commit the .example files instead
 server/archie-group.json
 server/devices.json
+
+# real definitions (personal addresses)
+server/groups.json

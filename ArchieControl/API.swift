@@ -18,19 +18,21 @@ enum APIError: LocalizedError {
 /// behind it only sees requests Access has already authenticated.
 final class API {
     static let base = URL(string: "https://rules.richmorgan.co.uk")!
+    /// The engine manages people as groups; this app is for one of them.
+    static let group = "archie"
     static let shared = API()
 
-    func status() async throws -> Status { try await get("/api/status") }
-    func usage() async throws -> Usage { try await get("/api/usage") }
+    func status() async throws -> Status { try await get("/api/\(Self.group)/status") }
+    func usage() async throws -> Usage { try await get("/api/\(Self.group)/usage") }
 
     func allow(target: String, minutes: Int? = nil, until: String? = nil, reason: String) async throws -> Status {
         var body: [String: Any] = ["target": target, "reason": reason]
         if let m = minutes { body["minutes"] = m }
         if let u = until { body["until"] = u }
-        return try await post("/api/allow", body)
+        return try await post("/api/\(Self.group)/allow", body)
     }
-    func revoke(target: String = "all") async throws -> Status { try await post("/api/revoke", ["target": target]) }
-    func flush(target: String = "all") async throws -> Status { try await post("/api/flush", ["target": target]) }
+    func revoke(target: String = "all") async throws -> Status { try await post("/api/\(Self.group)/revoke", ["target": target]) }
+    func flush(target: String = "all") async throws -> Status { try await post("/api/\(Self.group)/flush", ["target": target]) }
 
     private func get<T: Decodable>(_ path: String) async throws -> T {
         try await send(request(path, method: "GET", body: nil))

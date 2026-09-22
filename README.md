@@ -34,15 +34,18 @@ within a minute.
 
 ## Layout
 
-- `server/policy.py` - the engine. `tick` (cron), `status`, `allow <target> <minutes|HH:MM>`,
-  `revoke`, `flush`. Talks to the gateway with a UniFi API key: a local key against the
+- `server/policy.py` - the engine. People are *groups* of hosts. `tick` (cron), `groups`,
+  `status [group]`, `allow <group> <target> <minutes|HH:MM>`, `revoke`, `flush`, `forget`. Talks to the gateway with a UniFi API key: a local key against the
   gateway's IP, or a Site Manager key through Ubiquiti's cloud relay (put the console id in
   `host.id`).
-- `server/api.py` - a stdlib HTTP API on `127.0.0.1:8787` for the app: status, allow, revoke,
-  flush, usage. It trusts the `Cf-Access-Authenticated-User-Email` header, which is safe
+- `server/api.py` - a stdlib HTTP API on `127.0.0.1:8787`. It *advertises its services*:
+  `GET /services` returns MCP-shaped tool definitions (`home_groups`, `home_status`,
+  `home_allow`, ...) and `POST /call/<tool>` runs one, so an MCP connector can stay
+  paper-thin and pick up new capabilities without redeploying. The app uses the same
+  services as REST under `/api/<group>/...`. It trusts the `Cf-Access-Authenticated-User-Email` header, which is safe
   because only the tunnel on the same host can reach it, and Cloudflare Access sets it.
-- `server/archie-group.example.json` - the group definition: hub switch, consoles, wifi
-  devices, which rule covers which set.
+- `server/groups.example.json` - the group definitions: per person, their hub switch,
+  consoles, wifi devices, and which rule covers which set.
 - `ArchieControl/` - the iPhone app. Signs in with `ASWebAuthenticationSession` against
   `/auth/start`; the API bounces the Access JWT back through a custom URL scheme and the
   app sends it as `cf-access-token` from then on.
@@ -54,8 +57,8 @@ within a minute.
    for YouTube on the kids' network, all Mon-Fri school hours. Give them a common
    description prefix (`MANAGED_PREFIX` in `policy.py`, default `Archie - `).
 2. **Server.** Copy `server/` to your Linux box. Put a UniFi API key in `unifi.key` (0600).
-   Copy `archie-group.example.json` to `archie-group.json` and fill in your addresses and
-   rule ids (`policy.py status` prints them). Copy `allowed-emails.example.txt` to
+   Copy `groups.example.json` to `groups.json` and fill in your addresses and rule ids
+   (`policy.py status` prints them). Copy `allowed-emails.example.txt` to
    `allowed-emails.txt`. Install the systemd unit and a cron line:
    `* * * * * /path/policy.py tick >> /path/engine.log 2>&1`.
 3. **Cloudflare.** A Tunnel public hostname pointing at `http://localhost:8787`, and an
@@ -74,5 +77,8 @@ within a minute.
 - A `PUT` of an unchanged rule does not cut sessions, and force-provisioning the gateway
   does not either. Off then on does.
 - Ubiquiti's cloud relay occasionally returns a truncated body; retry.
+- Don't define a group by a switch *port* on a shared switch. Recabling put the family
+  server on that port for an hour and the engine dutifully blocked it the next school day.
+  Discover by the child's own switch only, and keep a `forget` command.
 
 MIT licence. No warranty; it's a hobby project that happens to work.

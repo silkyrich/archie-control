@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
 """
-Home policy engine for UniFi traffic rules.
+Home policy engine: a people layer over UniFi traffic rules.
 
-UniFi enforces the rules and their weekly schedules itself. This script fills
-the two gaps we found by testing on 2026-09-17:
+UniFi enforces the rules and their weekly schedules. This adds what it lacks:
 
-  1. When a scheduled window STARTS, the gateway only blocks NEW connections.
-     A YouTube stream or Roblox session opened before 08:30 carries on.
-     Switching the rule off and on again kills those sessions, so `tick` does
-     that at the moment each window opens.
-  2. Timed overrides ("give Archie an hour"): the rule is disabled now and
-     re-enabled when the override expires. Re-enabling inside a window also
-     kills open sessions.
-
-Only rules whose description starts with MANAGED_PREFIX are touched.
+  * groups — a person is the set of hosts we know are theirs: anything wired
+    behind their own switch (discovered, remembered 30 days), plus named
+    consoles and wifi devices. Rules belong to a group by description prefix.
+  * session cuts — when a rule's window OPENS, UniFi only blocks new
+    connections; a stream started beforehand carries on. Off→on kills it, so
+    `tick` does that the minute a window opens.
+  * timed overrides — "allow until 17:00" disables the rules now and the tick
+    restores them on time. Restoring inside a window also cuts sessions.
 
 Usage:
-  policy.py tick                         run every minute from cron
-  policy.py status
-  policy.py allow <target> <minutes|HH:MM> [reason...]
-  policy.py revoke <target>
-  policy.py flush <target>               kill open sessions now
+  policy.py tick                                    every minute from cron
+  policy.py groups
+  policy.py status [group]
+  policy.py allow  <group> <target> <minutes|HH:MM> [reason...]
+  policy.py revoke <group> <target>
+  policy.py flush  <group> <target>                 cut open sessions now
+  policy.py forget <group> <mac>                    drop a wrongly-discovered device
 
 <target> is `all`, a rule id, or a word from the rule's description
 (`youtube`, `games`, `xbox`, ...).
+
+Config: groups.json — {"<group>": {"prefix": "Archie - ", "hub": {...},
+"consoles": {mac: name}, "wifi": {mac: name}, "wired": [mac], "rules":
+{rule_id: ["hub","consoles","wifi"]}}}. A legacy single-group
+archie-group.json is read as group "archie".
 """
 
 import copy
@@ -41,11 +46,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 KEY_FILE = os.path.join(HERE, "unifi.key")
 HOST_FILE = os.path.join(HERE, "host.id")   # present => cloud key, relay via api.ui.com
 STATE_FILE = os.path.join(HERE, "state.json")
-GROUP_FILE = os.path.join(HERE, "archie-group.json")
+GROUPS_FILE = os.path.join(HERE, "groups.json")
+LEGACY_GROUP_FILE = os.path.join(HERE, "archie-group.json")
 GATEWAY = "https://192.168.0.1/proxy/network/"
 SITE = "default"
 TZ = ZoneInfo("Europe/London")  # the host clock is UTC; UniFi schedules are local
-MANAGED_PREFIX = "Archie - "
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 _ctx = ssl._create_unverified_context()  # the gateway's certificate is self-signed
@@ -54,6 +59,12 @@ _ctx = ssl._create_unverified_context()  # the gateway's certificate is self-sig
 def log(msg):
     print(f"{dt.datetime.now(TZ):%Y-%m-%d %H:%M:%S} {msg}", flush=True)
 
+
+class PolicyError(Exception):
+    """A user-facing problem (bad target, unknown group, gateway refused)."""
+
+
+# ── UniFi ────────────────────────────────────────────────────────────────
 
 def base_url():
     """A local gateway key talks to 192.168.0.1 directly; a Site Manager key
@@ -79,21 +90,47 @@ def api(path, body=None, method="GET", tries=3):
             raw = urllib.request.urlopen(req, timeout=30, context=_ctx).read().decode()
             return json.loads(raw) if raw.strip() else {}
         except urllib.error.HTTPError as e:
-            raise SystemExit(f"UniFi {method} {path} -> {e.code}: {e.read().decode()[:300]}")
+            raise PolicyError(f"UniFi {method} {path} -> {e.code}: {e.read().decode()[:300]}")
         except (json.JSONDecodeError, urllib.error.URLError, TimeoutError, OSError) as e:
             # The cloud relay occasionally returns a truncated body or drops
             # the connection; a second try a moment later almost always works.
             last = e
             time.sleep(2 * (attempt + 1))
-    raise SystemExit(f"UniFi {method} {path} failed after {tries} tries: {last!r}"[:300])
+    raise PolicyError(f"UniFi {method} {path} failed after {tries} tries: {last!r}"[:300])
 
 
 def rules_url(rid=""):
     return f"v2/api/site/{SITE}/trafficrules" + (f"/{rid}" if rid else "")
 
 
-def managed_rules():
-    return [r for r in api(rules_url()) if r.get("description", "").startswith(MANAGED_PREFIX)]
+def all_rules():
+    return api(rules_url())
+
+
+def live_clients():
+    return api(f"api/s/{SITE}/stat/sta").get("data", [])
+
+
+# ── config and state ─────────────────────────────────────────────────────
+
+def load_groups():
+    """name -> group definition. Falls back to the legacy single-group file."""
+    if os.path.exists(GROUPS_FILE):
+        with open(GROUPS_FILE) as f:
+            return {k: v for k, v in json.load(f).items() if not k.startswith("_")}
+    if os.path.exists(LEGACY_GROUP_FILE):
+        with open(LEGACY_GROUP_FILE) as f:
+            g = json.load(f)
+        g.setdefault("prefix", "Archie - ")
+        return {"archie": g}
+    return {}
+
+
+def group(name):
+    gs = load_groups()
+    if name not in gs:
+        raise PolicyError(f"No group '{name}'. Groups: {', '.join(gs) or 'none configured'}")
+    return gs[name]
 
 
 def load_state():
@@ -102,84 +139,12 @@ def load_state():
             s = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         s = {}
-    s.setdefault("overrides", {})
-    s.setdefault("in_window", {})
-    s.setdefault("hub_seen", {})   # mac -> {"name", "last_seen"} for devices wired behind the hub
+    s.setdefault("overrides", {})     # rule id -> {until, reason, set_at}
+    s.setdefault("in_window", {})     # rule id -> bool, last tick
+    hub = s.setdefault("hub_seen", {})  # group -> mac -> {name, last_seen}
+    if hub and all(":" in k for k in hub):  # pre-groups layout: flat mac map
+        s["hub_seen"] = {"archie": hub}
     return s
-
-
-def load_group():
-    try:
-        with open(GROUP_FILE) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return None
-
-
-def live_clients():
-    return api(f"api/s/{SITE}/stat/sta").get("data", [])
-
-
-def sync_group(state, now, clients=None):
-    """Keep the rules' device lists in step with Archie's group.
-
-    'hub' members are discovered from where wired clients sit: behind his Flex
-    Mini, or straight into the Office switch port it uplinks on. They are
-    remembered for `remember_days` so the Xbox is still covered when it's
-    powered off and comes back at 07:31. Members are only ever added to a
-    rule, never removed, so hand-made targets survive.
-    """
-    g = load_group()
-    if not g:
-        return []
-    hub = g.get("hub") or {}
-    fb = hub.get("fallback_port") or {}
-    for c in (clients if clients is not None else live_clients()):
-        if not c.get("is_wired"):
-            continue
-        sw, port = str(c.get("sw_mac", "")).lower(), c.get("sw_port")
-        behind_hub = sw == hub.get("switch_mac", "").lower()
-        on_port = sw == str(fb.get("switch_mac", "")).lower() and port == fb.get("port")
-        if behind_hub or on_port:
-            state["hub_seen"][c["mac"].lower()] = {"name": c.get("name") or c.get("hostname") or c["mac"],
-                                                    "last_seen": now.isoformat(timespec="seconds")}
-    keep = now - dt.timedelta(days=hub.get("remember_days", 30))
-    for mac in [m for m, v in state["hub_seen"].items() if dt.datetime.fromisoformat(v["last_seen"]) < keep]:
-        state["hub_seen"].pop(mac)
-
-    sets = {"hub": set(state["hub_seen"]),
-            "consoles": {m.lower() for m in (g.get("consoles") or {})},
-            "wifi": {m.lower() for m in (g.get("wifi") or {})}}
-    changed = []
-    rules = {r["_id"]: r for r in managed_rules()}
-    for rid, want_sets in (g.get("rules") or {}).items():
-        r = rules.get(rid)
-        if not r:
-            continue
-        want = set().union(*(sets[s] for s in want_sets if s in sets))
-        have = {str(t.get("client_mac", "")).lower() for t in r.get("target_devices", []) if t.get("type") == "CLIENT"}
-        missing = sorted(want - have)
-        if missing:
-            body = copy.deepcopy(r)
-            body["target_devices"] = r.get("target_devices", []) + [{"type": "CLIENT", "client_mac": m} for m in missing]
-            api(rules_url(rid), body, "PUT")
-            changed.append((r["description"], missing))
-    return changed
-
-
-def group_members():
-    """Name -> macs for everything in the group, for status and the app."""
-    g = load_group() or {}
-    state = load_state()
-    out = {}
-    for m, n in (g.get("consoles") or {}).items():
-        out.setdefault(n, []).append(m.lower())
-    for m, n in (g.get("wifi") or {}).items():
-        out.setdefault(n, []).append(m.lower())
-    for m, v in state["hub_seen"].items():
-        if not any(m in macs for macs in out.values()):
-            out.setdefault(v["name"], []).append(m)
-    return out
 
 
 def save_state(state):
@@ -189,6 +154,13 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
+# ── rules ────────────────────────────────────────────────────────────────
+
+def managed_rules(gname, rules=None):
+    prefix = group(gname).get("prefix", "")
+    return [r for r in (rules if rules is not None else all_rules()) if r.get("description", "").startswith(prefix)]
+
+
 def in_window(rule, now):
     """Is the rule's own UniFi schedule active at `now` (local time)?"""
     s = rule.get("schedule") or {}
@@ -196,7 +168,7 @@ def in_window(rule, now):
     if mode == "ALWAYS":
         return True
     if mode != "EVERY_WEEK":
-        return False  # one-off modes aren't used here
+        return False
     today = DAYS[now.weekday()]
     yesterday = DAYS[(now.weekday() - 1) % 7]
     days = s.get("repeat_on_days") or []
@@ -207,8 +179,7 @@ def in_window(rule, now):
     t = now.time()
     if start <= end:
         return today in days and start <= t < end
-    # Overnight window, e.g. 21:00-07:00: the early part belongs to the day before.
-    return (today in days and t >= start) or (yesterday in days and t < end)
+    return (today in days and t >= start) or (yesterday in days and t < end)  # overnight window
 
 
 def set_enabled(rule, enabled):
@@ -225,15 +196,16 @@ def flush(rule):
 
 
 def resolve(target, rules):
-    if target == "all":
+    if target in ("all", "", None):
         return rules
     hit = [r for r in rules if r["_id"] == target or target.lower() in r["description"].lower()]
     if not hit:
-        raise SystemExit(f"No managed rule matches '{target}'. Try: status")
+        raise PolicyError(f"No rule matches '{target}'. Rules: " + "; ".join(r["description"] for r in rules))
     return hit
 
 
 def parse_until(spec, now):
+    spec = str(spec)
     if ":" in spec:
         h, m = (int(x) for x in spec.split(":"))
         until = now.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -243,106 +215,229 @@ def parse_until(spec, now):
     return now + dt.timedelta(minutes=int(spec))
 
 
+# ── groups: membership discovery ─────────────────────────────────────────
+
+def sync_groups(state, now, clients=None):
+    """Keep each group's rules in step with its members.
+
+    'hub' members are discovered from where wired clients sit: behind the
+    group's own switch, or on the upstream port it uplinks through. They are
+    remembered for `remember_days` so a console that is off tonight is still
+    covered when it comes back tomorrow. Members are only ever added to a
+    rule, never removed, so hand-made targets survive.
+    """
+    groups = load_groups()
+    if not groups:
+        return []
+    clients = clients if clients is not None else live_clients()
+    rules = {r["_id"]: r for r in all_rules()}
+    changed = []
+    for gname, g in groups.items():
+        hub = g.get("hub") or {}
+        fb = hub.get("fallback_port") or {}
+        seen = state["hub_seen"].setdefault(gname, {})
+        for c in clients:
+            if not c.get("is_wired"):
+                continue
+            sw, port = str(c.get("sw_mac", "")).lower(), c.get("sw_port")
+            if sw == str(hub.get("switch_mac", "")).lower() or \
+               (sw == str(fb.get("switch_mac", "")).lower() and port == fb.get("port")):
+                seen[c["mac"].lower()] = {"name": c.get("name") or c.get("hostname") or c["mac"],
+                                          "last_seen": now.isoformat(timespec="seconds")}
+        keep = now - dt.timedelta(days=hub.get("remember_days", 30))
+        for mac in [m for m, v in seen.items() if dt.datetime.fromisoformat(v["last_seen"]) < keep]:
+            seen.pop(mac)
+
+        sets = {"hub": set(seen),
+                "consoles": {m.lower() for m in (g.get("consoles") or {})},
+                "wifi": {m.lower() for m in (g.get("wifi") or {})}}
+        for rid, want_sets in (g.get("rules") or {}).items():
+            r = rules.get(rid)
+            if not r:
+                continue
+            want = set().union(*(sets[s] for s in want_sets if s in sets))
+            have = {str(t.get("client_mac", "")).lower() for t in r.get("target_devices", []) if t.get("type") == "CLIENT"}
+            missing = sorted(want - have)
+            if missing:
+                body = copy.deepcopy(r)
+                body["target_devices"] = r.get("target_devices", []) + [{"type": "CLIENT", "client_mac": m} for m in missing]
+                api(rules_url(rid), body, "PUT")
+                changed.append((gname, r["description"], missing))
+    return changed
+
+
+def members(gname, state=None):
+    """Device name -> {macs, wired} for everything in the group."""
+    g = group(gname)
+    state = state or load_state()
+    seen = state["hub_seen"].get(gname, {})
+    wired = set(seen) | {m.lower() for m in g.get("wired", [])}
+    out = {}
+    for m, n in list((g.get("consoles") or {}).items()) + list((g.get("wifi") or {}).items()):
+        out.setdefault(n, {"macs": [], "wired": []})["macs"].append(m.lower())
+    for m, v in seen.items():
+        if not any(m in d["macs"] for d in out.values()):
+            out.setdefault(v["name"], {"macs": [], "wired": []})["macs"].append(m)
+    for d in out.values():
+        d["wired"] = [m for m in d["macs"] if m in wired]
+    return out
+
+
+# ── views (shared by the CLI and the API) ────────────────────────────────
+
+def rule_view(r, state, now):
+    s = r.get("schedule") or {}
+    ov = state["overrides"].get(r["_id"])
+    return {
+        "id": r["_id"],
+        "name": r["description"],
+        "enabled": r["enabled"],
+        "blocking": bool(r["enabled"] and in_window(r, now)),
+        "schedule": "always" if s.get("mode") == "ALWAYS" else
+                    {"days": s.get("repeat_on_days"), "start": s.get("time_range_start"), "end": s.get("time_range_end")},
+        "override": None if not ov else {"until": ov["until"], "reason": ov.get("reason"), "set_at": ov.get("set_at")},
+    }
+
+
+def group_status(gname, rules=None, state=None, now=None):
+    now = now or dt.datetime.now(TZ)
+    state = state or load_state()
+    rs = managed_rules(gname, rules)
+    return {
+        "group": gname,
+        "now": now.isoformat(timespec="seconds"),
+        "rules": [rule_view(r, state, now) for r in rs],
+        "members": members(gname, state),
+    }
+
+
+# ── commands ─────────────────────────────────────────────────────────────
+
 def cmd_tick():
     if not os.path.exists(KEY_FILE):
         return  # not provisioned yet; stay quiet rather than fill the log every minute
     now = dt.datetime.now(TZ)
     state = load_state()
-    for desc, macs in sync_group(state, now):
-        log(f"group: added {', '.join(macs)} to {desc}")
-    for rule in managed_rules():
-        rid, name = rule["_id"], rule["description"]
-        active_now = in_window(rule, now)
-        was_active = state["in_window"].get(rid)
-        ov = state["overrides"].get(rid)
-        ov_live = bool(ov) and dt.datetime.fromisoformat(ov["until"]) > now
-
-        if ov and not ov_live:
-            state["overrides"].pop(rid)
-            log(f"override expired: {name}")
-
-        if ov_live:
-            if rule["enabled"]:
-                set_enabled(rule, False)
-                log(f"override active until {ov['until'][11:16]}, disabled: {name}")
-        elif not rule["enabled"]:
-            # Re-enabling inside a window also kills open sessions.
-            set_enabled(rule, True)
-            log(f"re-enabled{' (in window, sessions cut)' if active_now else ''}: {name}")
-        elif active_now and was_active is False:
-            flush(rule)
-            log(f"window opened, sessions cut: {name}")
-
-        state["in_window"][rid] = active_now
+    for gname, desc, macs in sync_groups(state, now):
+        log(f"{gname}: added {', '.join(macs)} to {desc}")
+    rules = all_rules()
+    for gname in load_groups():
+        for rule in managed_rules(gname, rules):
+            rid, name = rule["_id"], rule["description"]
+            active_now = in_window(rule, now)
+            was_active = state["in_window"].get(rid)
+            ov = state["overrides"].get(rid)
+            ov_live = bool(ov) and dt.datetime.fromisoformat(ov["until"]) > now
+            if ov and not ov_live:
+                state["overrides"].pop(rid)
+                log(f"override expired: {name}")
+            if ov_live:
+                if rule["enabled"]:
+                    set_enabled(rule, False)
+                    log(f"override active until {ov['until'][11:16]}, disabled: {name}")
+            elif not rule["enabled"]:
+                set_enabled(rule, True)  # re-enabling inside a window also cuts sessions
+                log(f"re-enabled{' (in window, sessions cut)' if active_now else ''}: {name}")
+            elif active_now and was_active is False:
+                flush(rule)
+                log(f"window opened, sessions cut: {name}")
+            state["in_window"][rid] = active_now
     save_state(state)
 
 
-def cmd_status():
-    now = dt.datetime.now(TZ)
-    state = load_state()
-    print(f"now {now:%a %H:%M} Europe/London")
-    for r in managed_rules():
-        s = r.get("schedule") or {}
-        when = "always" if s.get("mode") == "ALWAYS" else \
-            f"{','.join(s.get('repeat_on_days') or [])} {s.get('time_range_start')}-{s.get('time_range_end')}"
-        ov = state["overrides"].get(r["_id"])
-        extra = f"  OVERRIDE until {ov['until'][11:16]} ({ov.get('reason') or 'no reason'})" if ov else ""
-        print(f"  {'ON ' if r['enabled'] else 'off'} {'BLOCKING' if r['enabled'] and in_window(r, now) else 'idle    '} "
-              f"{r['description']}  [{when}]  id={r['_id']}{extra}")
-    members = group_members()
-    if members:
-        print("group:", "; ".join(f"{n} ({', '.join(m)})" for n, m in members.items()))
-        hub = load_state()["hub_seen"]
-        print("behind the hub:", ", ".join(f"{v['name']} (seen {v['last_seen'][:16]})" for v in hub.values()) or "nothing seen yet")
-
-
-def cmd_allow(target, spec, reason):
+def cmd_allow(gname, target, spec, reason):
     now = dt.datetime.now(TZ)
     until = parse_until(spec, now)
     state = load_state()
-    for r in resolve(target, managed_rules()):
+    for r in resolve(target, managed_rules(gname)):
         state["overrides"][r["_id"]] = {"until": until.isoformat(timespec="seconds"), "reason": reason,
                                         "set_at": now.isoformat(timespec="seconds")}
         if r["enabled"]:
             set_enabled(r, False)
-        log(f"allow until {until:%a %H:%M}: {r['description']}" + (f" ({reason})" if reason else ""))
+        log(f"{gname}: allow until {until:%a %H:%M}: {r['description']}" + (f" ({reason})" if reason else ""))
     save_state(state)
+    return until
 
 
-def cmd_revoke(target):
+def cmd_revoke(gname, target):
     state = load_state()
-    for r in resolve(target, managed_rules()):
+    for r in resolve(target, managed_rules(gname)):
         state["overrides"].pop(r["_id"], None)
         if not r["enabled"]:
             set_enabled(r, True)
-        log(f"override revoked, rule on: {r['description']}")
+        log(f"{gname}: override revoked, rule on: {r['description']}")
     save_state(state)
 
 
-def cmd_flush(target):
-    for r in resolve(target, managed_rules()):
+def cmd_flush(gname, target):
+    for r in resolve(target, managed_rules(gname)):
         if r["enabled"]:
             flush(r)
-            log(f"sessions cut: {r['description']}")
+            log(f"{gname}: sessions cut: {r['description']}")
+
+
+def cmd_forget(gname, mac):
+    """Drop a device from a group: from the discovered members and from every
+    rule's target list. For when the wrong thing got plugged into the hub."""
+    mac = mac.lower()
+    state = load_state()
+    was = state["hub_seen"].get(gname, {}).pop(mac, None)
+    removed = []
+    for r in managed_rules(gname):
+        targets = r.get("target_devices", [])
+        keep = [t for t in targets if str(t.get("client_mac", "")).lower() != mac]
+        if len(keep) != len(targets):
+            body = copy.deepcopy(r)
+            body["target_devices"] = keep
+            api(rules_url(r["_id"]), body, "PUT")
+            removed.append(r["description"])
+    save_state(state)
+    log(f"{gname}: forgot {mac} ({(was or {}).get('name', '?')}); removed from {len(removed)} rules")
+    return {"was_member": bool(was), "removed_from": removed}
+
+
+def cmd_status(gname=None):
+    now = dt.datetime.now(TZ)
+    state = load_state()
+    rules = all_rules()
+    print(f"now {now:%a %H:%M} Europe/London")
+    for g in ([gname] if gname else load_groups()):
+        st = group_status(g, rules, state, now)
+        print(f"[{g}]")
+        for r in st["rules"]:
+            when = r["schedule"] if r["schedule"] == "always" else \
+                f"{','.join(r['schedule']['days'] or [])} {r['schedule']['start']}-{r['schedule']['end']}"
+            ov = r["override"]
+            extra = f"  OVERRIDE until {ov['until'][11:16]} ({ov.get('reason') or 'no reason'})" if ov else ""
+            print(f"  {'ON ' if r['enabled'] else 'off'} {'BLOCKING' if r['blocking'] else 'idle    '} {r['name']}  [{when}]  id={r['id']}{extra}")
+        print("  members:", "; ".join(f"{n} ({', '.join(d['macs'])})" for n, d in st["members"].items()) or "none")
+        hub = state["hub_seen"].get(g, {})
+        print("  behind the hub:", ", ".join(f"{v['name']} (seen {v['last_seen'][:16]})" for v in hub.values()) or "nothing seen yet")
 
 
 def main(argv):
-    if not argv or argv[0] in ("-h", "--help"):
-        print(__doc__)
-        return
-    cmd, args = argv[0], argv[1:]
-    if cmd == "tick":
-        cmd_tick()
-    elif cmd == "status":
-        cmd_status()
-    elif cmd == "allow" and len(args) >= 2:
-        cmd_allow(args[0], args[1], " ".join(args[2:]))
-    elif cmd == "revoke" and len(args) == 1:
-        cmd_revoke(args[0])
-    elif cmd == "flush" and len(args) == 1:
-        cmd_flush(args[0])
-    else:
-        raise SystemExit(__doc__)
+    try:
+        if not argv or argv[0] in ("-h", "--help"):
+            print(__doc__)
+        elif argv[0] == "tick":
+            cmd_tick()
+        elif argv[0] == "groups":
+            for n, g in load_groups().items():
+                print(f"{n}: prefix {g.get('prefix')!r}, {len(g.get('rules') or {})} rules")
+        elif argv[0] == "status":
+            cmd_status(argv[1] if len(argv) > 1 else None)
+        elif argv[0] == "allow" and len(argv) >= 4:
+            cmd_allow(argv[1], argv[2], argv[3], " ".join(argv[4:]))
+        elif argv[0] == "revoke" and len(argv) == 3:
+            cmd_revoke(argv[1], argv[2])
+        elif argv[0] == "flush" and len(argv) == 3:
+            cmd_flush(argv[1], argv[2])
+        elif argv[0] == "forget" and len(argv) == 3:
+            print(cmd_forget(argv[1], argv[2]))
+        else:
+            raise SystemExit(__doc__)
+    except PolicyError as e:
+        raise SystemExit(str(e))
 
 
 if __name__ == "__main__":
