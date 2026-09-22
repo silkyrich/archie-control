@@ -223,7 +223,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def user(self):
-        email = (self.headers.get("Cf-Access-Authenticated-User-Email") or "").lower()
+        # A person signing in through Access arrives with their email. A
+        # machine using an Access service token (the MCP connector) carries no
+        # email, so it names the person who asked in X-Home-Actor. Both are
+        # trustworthy only because nothing but the tunnel can reach this port.
+        email = (self.headers.get("Cf-Access-Authenticated-User-Email") or
+                 self.headers.get("X-Home-Actor") or "").lower()
         return email if email and email in allowed_emails() else None
 
     def do_GET(self):
